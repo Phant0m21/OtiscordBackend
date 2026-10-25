@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints
 from pwdlib import PasswordHash
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid, create_engine, delete, select
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid, create_engine, delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -127,6 +127,11 @@ class RegisterInput(BaseModel):
 class LoginInput(BaseModel):
     email: EmailStr
     password: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+
+
+class AccountDeletionInput(BaseModel):
+    password: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    confirmation: Annotated[str, StringConstraints(pattern="^УДАЛИТЬ$")]
 
 
 class DirectInput(BaseModel):
@@ -280,6 +285,61 @@ def login(data: LoginInput, db: Db):
 @app.get("/api/auth/me", response_model=UserOut)
 def me(user: CurrentUser):
     return user
+
+
+@app.delete("/api/auth/account", status_code=204)
+def delete_account(data: AccountDeletionInput, db: Db, user: CurrentUser):
+    if not password_hash.verify(data.password, user.password_hash):
+        raise HTTPException(status_code=403, detail="Неверный пароль.")
+
+    memberships = db.scalars(
+        select(Conversation)
+        .join(ConversationMember, ConversationMember.conversation_id == Conversation.id)
+        .where(ConversationMember.user_id == user.id)
+    ).all()
+    direct_ids = {item.id for item in memberships if item.kind == "direct"}
+    empty_group_ids = set()
+
+    for conversation in memberships:
+        if conversation.kind != "group":
+            continue
+        remaining_member_id = db.scalar(
+            select(ConversationMember.user_id)
+            .where(
+                ConversationMember.conversation_id == conversation.id,
+                ConversationMember.user_id != user.id,
+            )
+            .limit(1)
+        )
+        if remaining_member_id is None:
+            empty_group_ids.add(conversation.id)
+        elif conversation.created_by == user.id:
+            conversation.created_by = remaining_member_id
+
+    deleted_conversation_ids = direct_ids | empty_group_ids
+    deleted_message_ids = select(Message.id).where(
+        or_(
+            Message.sender_id == user.id,
+            Message.conversation_id.in_(deleted_conversation_ids),
+        )
+    )
+    db.execute(
+        delete(Reaction).where(
+            or_(
+                Reaction.user_id == user.id,
+                Reaction.message_id.in_(deleted_message_ids),
+            )
+        )
+    )
+    db.execute(delete(Message).where(Message.id.in_(deleted_message_ids)))
+    db.execute(delete(ConversationMember).where(ConversationMember.user_id == user.id))
+    if deleted_conversation_ids:
+        db.execute(delete(Conversation).where(Conversation.id.in_(deleted_conversation_ids)))
+    db.delete(user)
+    db.commit()
+
+    if websockets.loop is not None and websockets.loop.is_running():
+        asyncio.run_coroutine_threadsafe(websockets.disconnect_user(user.id), websockets.loop)
 
 
 def membership(db: Session, conversation_id: UUID, user_id: UUID) -> Conversation:
@@ -540,15 +600,33 @@ def toggle_reaction(message_id: UUID, data: ReactionInput, db: Db, user: Current
 class WebSocketManager:
     def __init__(self):
         self.connections: dict[UUID, set[WebSocket]] = defaultdict(set)
+        self.connection_users: dict[WebSocket, UUID] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
 
-    async def connect(self, conversation_id: UUID, socket: WebSocket) -> None:
+    async def connect(self, conversation_id: UUID, user_id: UUID, socket: WebSocket) -> None:
         self.connections[conversation_id].add(socket)
+        self.connection_users[socket] = user_id
 
     def disconnect(self, conversation_id: UUID, socket: WebSocket) -> None:
         self.connections[conversation_id].discard(socket)
+        self.connection_users.pop(socket, None)
         if not self.connections[conversation_id]:
             self.connections.pop(conversation_id, None)
+
+    async def disconnect_user(self, user_id: UUID) -> None:
+        sockets = [
+            (conversation_id, socket)
+            for conversation_id, connections in self.connections.items()
+            for socket in connections
+            if self.connection_users.get(socket) == user_id
+        ]
+        for conversation_id, socket in sockets:
+            self.disconnect(conversation_id, socket)
+        if sockets:
+            await asyncio.gather(
+                *(socket.close(code=1008, reason="Account deleted.") for _, socket in sockets),
+                return_exceptions=True,
+            )
 
     async def broadcast(self, conversation_id: UUID, event: dict) -> None:
         sockets = list(self.connections.get(conversation_id, ()))
@@ -594,7 +672,7 @@ async def websocket_endpoint(socket: WebSocket):
         with SessionLocal() as db:
             user = user_from_token(token, db)
             membership(db, conversation_id, user.id)
-        await websockets.connect(conversation_id, socket)
+        await websockets.connect(conversation_id, user.id, socket)
         await socket.send_json({"type": "connected"})
         while True:
             await socket.receive_text()
