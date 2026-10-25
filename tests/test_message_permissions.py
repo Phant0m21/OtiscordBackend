@@ -599,6 +599,21 @@ def test_websocket_broadcasts_typing_to_group_members(client: TestClient) -> Non
             assert event["username"] == "alice"
 
 
+def test_cors_preflight_allows_avatar_put(client: TestClient) -> None:
+    response = client.options(
+        "/api/users/me/avatar",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "PUT" in response.headers["access-control-allow-methods"]
+
+
 def test_api_documentation_routes_follow_environment(client: TestClient) -> None:
     if main.ENVIRONMENT == "development":
         assert client.get("/docs").status_code == 200
