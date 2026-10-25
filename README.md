@@ -27,7 +27,7 @@ Apply the versioned schema with the **direct** Neon connection before starting t
    uvicorn app.main:app --reload --port 8000
    ```
 
-The API uses the pooled `DATABASE_URL`; Alembic prefers `DATABASE_URL_UNPOOLED`. Check `http://127.0.0.1:8000/api/health` and `http://127.0.0.1:8000/docs`.
+   The API uses the pooled `DATABASE_URL`; Alembic prefers `DATABASE_URL_UNPOOLED`. Run `alembic upgrade head` against the intended branch before deploying a backend release that includes a new migration. Revision `0003_profile_presence` adds profile and online-status fields. Check `http://127.0.0.1:8000/api/health` and `http://127.0.0.1:8000/docs`.
 
 Set `ENVIRONMENT=development` in `backend\.env` to enable the interactive API docs at `/docs` (and `/redoc`). With any other value, including `production`, the docs and OpenAPI schema endpoints return 404. Do not set it to `development` in the Vercel production environment.
 
@@ -40,6 +40,8 @@ The root `neon.ts` declares a private `otiscord-attachments` bucket. Apply it to
 Configure the bucket's CORS rules for the frontend's local and production origins. Allow `GET`, `PUT`, and `HEAD`, allow the `Content-Type` and `Range` request headers, and expose `ETag`, `Content-Length`, `Content-Range`, and `Accept-Ranges` so direct uploads and video seeking work in the browser. Do not use `*` for allowed origins in production; add your exact Vercel production domain and any preview origin pattern you use.
 
 The upload flow sends bytes directly from the browser to object storage, verifies the stored size and content type, then attaches the file to a message. Any file type is accepted, with a maximum size of 50 MiB per file; up to 10 files can be attached to one message. Supported images, video, and audio are served inline through expiring signed URLs; other file types download as attachments.
+
+If the backend health response has `storage_configured: false`, file and avatar uploads are unavailable until the backend environment has all four `AWS_*` credentials above. Configure those values in the backend's Vercel project (and redeploy); never add them to the frontend.
 
 For the Vercel backend, add these four `AWS_*` values and `ATTACHMENTS_BUCKET` to the backend project's environment variables for each environment that should accept uploads. Neon CLI env pulls update local files only; they do not configure Vercel. Keep all storage credentials and `AUTH_SECRET` on the backend, never in the frontend project. Use different database branches and storage credentials for development and production.
 

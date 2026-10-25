@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from uuid import UUID
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -436,6 +437,166 @@ def test_attachment_upload_supports_other_types_and_enforces_50_mib_limit(
         f"/api/attachments/{oversized_id}/complete",
         headers=alice_headers,
     ).status_code == 404
+
+
+def test_profile_updates_reject_future_birth_dates(client: TestClient) -> None:
+    token, _ = register(client, "alice", "alice@example.com")
+    headers = auth_headers(token)
+
+    updated = client.patch(
+        "/api/users/me",
+        headers=headers,
+        json={"bio": "  Привет!  ", "birth_date": "2000-02-29"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["bio"] == "Привет!"
+    assert updated.json()["birth_date"] == "2000-02-29"
+
+    future = client.patch(
+        "/api/users/me",
+        headers=headers,
+        json={"bio": "Updated", "birth_date": "2999-01-01"},
+    )
+    assert future.status_code == 422
+    assert client.get("/api/auth/me", headers=headers).json()["bio"] == "Привет!"
+
+
+def test_avatar_upload_requires_own_key_and_replaces_previous_avatar(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StorageStub:
+        deleted: list[str] = []
+        uploaded_keys: set[str] = set()
+
+        def generate_presigned_url(self, operation, Params, ExpiresIn):
+            if operation == "put_object":
+                self.uploaded_keys.add(Params["Key"])
+            return f"https://storage.example/{operation}/{Params['Key']}"
+
+        def head_object(self, Bucket, Key):
+            if Key not in self.uploaded_keys:
+                raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
+            return {"ContentLength": 1024, "ContentType": "image/png"}
+
+        def delete_objects(self, **kwargs):
+            self.deleted.extend(item["Key"] for item in kwargs["Delete"]["Objects"])
+
+    storage = StorageStub()
+    monkeypatch.setattr(main, "storage_client", lambda: storage)
+    token, user = register(client, "alice", "alice@example.com")
+    headers = auth_headers(token)
+
+    first_upload = client.post(
+        "/api/users/me/avatar",
+        headers=headers,
+        json={"filename": "avatar.png", "content_type": "image/png", "size": 1024},
+    )
+    assert first_upload.status_code == 201
+    first_key = first_upload.json()["object_key"]
+    first_saved = client.put(
+        "/api/users/me/avatar",
+        headers=headers,
+        json={"object_key": first_key},
+    )
+    assert first_saved.status_code == 200
+    assert first_saved.json()["avatar_url"].startswith("https://storage.example/get_object/")
+
+    rejected = client.put(
+        "/api/users/me/avatar",
+        headers=headers,
+        json={"object_key": f"avatars/{user['id']}/not-uploaded"},
+    )
+    assert rejected.status_code == 409
+
+    second_upload = client.post(
+        "/api/users/me/avatar",
+        headers=headers,
+        json={"filename": "avatar.png", "content_type": "image/png", "size": 1024},
+    )
+    second_key = second_upload.json()["object_key"]
+    replaced = client.put(
+        "/api/users/me/avatar",
+        headers=headers,
+        json={"object_key": second_key},
+    )
+    assert replaced.status_code == 200
+    assert storage.deleted == [first_key]
+
+
+def test_group_members_can_be_managed_and_owner_transfers_on_leave(
+    client: TestClient,
+) -> None:
+    alice_token, _ = register(client, "alice", "alice@example.com")
+    bob_token, bob = register(client, "bob", "bob@example.com")
+    carol_token, carol = register(client, "carol", "carol@example.com")
+    alice_headers = auth_headers(alice_token)
+
+    group = client.post(
+        "/api/conversations/group",
+        headers=alice_headers,
+        json={"name": "Team", "usernames": ["bob"]},
+    ).json()
+    forbidden_add = client.post(
+        f"/api/conversations/{group['id']}/members",
+        headers=auth_headers(bob_token),
+        json={"usernames": ["carol"]},
+    )
+    assert forbidden_add.status_code == 403
+
+    added = client.post(
+        f"/api/conversations/{group['id']}/members",
+        headers=alice_headers,
+        json={"usernames": ["carol"]},
+    )
+    assert added.status_code == 200
+    assert {member["username"] for member in added.json()["members"]} == {"alice", "bob", "carol"}
+
+    removed = client.delete(
+        f"/api/conversations/{group['id']}/members/{bob['id']}",
+        headers=alice_headers,
+    )
+    assert removed.status_code == 204
+    assert client.get("/api/conversations", headers=auth_headers(bob_token)).json() == []
+
+    left = client.post(f"/api/conversations/{group['id']}/leave", headers=alice_headers)
+    assert left.status_code == 204
+    with main.SessionLocal() as db:
+        conversation = db.get(main.Conversation, UUID(group["id"]))
+        assert conversation is not None
+        assert str(conversation.created_by) == carol["id"]
+
+    deleted = client.delete(
+        f"/api/conversations/{group['id']}",
+        headers=auth_headers(carol_token),
+    )
+    assert deleted.status_code == 204
+    assert client.get("/api/conversations", headers=auth_headers(carol_token)).json() == []
+
+
+def test_websocket_broadcasts_typing_to_group_members(client: TestClient) -> None:
+    alice_token, _ = register(client, "alice", "alice@example.com")
+    bob_token, _ = register(client, "bob", "bob@example.com")
+    group = client.post(
+        "/api/conversations/group",
+        headers=auth_headers(alice_token),
+        json={"name": "Team", "usernames": ["bob"]},
+    ).json()
+
+    with client.websocket_connect("/ws") as alice_socket:
+        alice_socket.send_json({"token": alice_token})
+        assert alice_socket.receive_json()["type"] == "connected"
+        with client.websocket_connect("/ws") as bob_socket:
+            bob_socket.send_json({"token": bob_token})
+            assert bob_socket.receive_json()["type"] == "connected"
+            alice_socket.send_json({
+                "type": "typing",
+                "conversation_id": group["id"],
+            })
+            event = bob_socket.receive_json()
+            assert event["type"] == "typing"
+            assert event["conversation_id"] == group["id"]
+            assert event["username"] == "alice"
 
 
 def test_api_documentation_routes_follow_environment(client: TestClient) -> None:

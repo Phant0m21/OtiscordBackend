@@ -4,7 +4,7 @@ import re
 import secrets
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints
 from pwdlib import PasswordHash
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid, create_engine, delete, func, or_, select
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid, create_engine, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -73,6 +73,11 @@ class User(Base):
     email_key: Mapped[str] = mapped_column(String(254), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     avatar_color: Mapped[str] = mapped_column(String(16), nullable=False, default="mint")
+    bio: Mapped[str] = mapped_column(String(190), nullable=False, default="")
+    birth_date: Mapped[date | None] = mapped_column(Date)
+    avatar_key: Mapped[str | None] = mapped_column(String(256))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    is_online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
@@ -184,8 +189,27 @@ class DirectInput(BaseModel):
     username: Annotated[str, StringConstraints(min_length=2, max_length=32)]
 
 
+class ProfileInput(BaseModel):
+    bio: Annotated[str, StringConstraints(max_length=190)] = ""
+    birth_date: date | None = None
+
+
+class AvatarUploadInput(BaseModel):
+    filename: Annotated[str, StringConstraints(min_length=1, max_length=255)]
+    content_type: Annotated[str, StringConstraints(pattern="^image/(jpeg|png|webp|avif)$")]
+    size: Annotated[int, Field(gt=0, le=5 * 1024 * 1024)]
+
+
+class AvatarCompleteInput(BaseModel):
+    object_key: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+
+
 class GroupInput(BaseModel):
     name: Annotated[str, StringConstraints(min_length=2, max_length=80)]
+    usernames: list[Annotated[str, StringConstraints(min_length=2, max_length=32)]] = Field(min_length=1, max_length=49)
+
+
+class GroupMembersInput(BaseModel):
     usernames: list[Annotated[str, StringConstraints(min_length=2, max_length=32)]] = Field(min_length=1, max_length=49)
 
 
@@ -219,6 +243,11 @@ class UserOut(BaseModel):
     username: str
     tag: str
     avatar_color: str
+    bio: str = ""
+    birth_date: date | None = None
+    avatar_url: str | None = None
+    last_seen_at: datetime | None = None
+    is_online: bool = False
 
 
 class AuthOut(BaseModel):
@@ -250,6 +279,7 @@ class ConversationOut(BaseModel):
     kind: str
     name: str
     updated_at: datetime
+    created_by: UUID
     members: list[UserOut]
     last_message: MessageOut | None
 
@@ -277,7 +307,10 @@ Db = Annotated[Session, Depends(get_db)]
 def storage_client():
     required = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL_S3", "AWS_REGION")
     if any(not os.getenv(name) for name in required):
-        raise HTTPException(status_code=503, detail="File storage is not configured on this server.")
+        raise HTTPException(
+            status_code=503,
+            detail="Загрузка файлов недоступна: владелец приложения ещё не подключил Object Storage к backend.",
+        )
     return boto3.client(
         "s3",
         region_name=os.environ["AWS_REGION"],
@@ -285,6 +318,33 @@ def storage_client():
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def user_output(user: User) -> UserOut:
+    avatar_url = None
+    if user.avatar_key:
+        storage = storage_client()
+        avatar_url = storage.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": ATTACHMENTS_BUCKET, "Key": user.avatar_key},
+            ExpiresIn=43200,
+        )
+    last_seen_at = user.last_seen_at
+    if last_seen_at and last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        tag=user.tag,
+        avatar_color=user.avatar_color,
+        bio=user.bio,
+        birth_date=user.birth_date,
+        avatar_url=avatar_url,
+        last_seen_at=last_seen_at,
+        is_online=user.is_online and bool(
+            last_seen_at and last_seen_at >= datetime.now(timezone.utc) - timedelta(seconds=75)
+        ),
     )
 
 
@@ -367,7 +427,7 @@ CurrentUser = Annotated[User, Depends(current_user)]
 
 
 def auth_response(user: User) -> AuthOut:
-    return AuthOut(access_token=create_access_token(user.id), user=UserOut.model_validate(user))
+    return AuthOut(access_token=create_access_token(user.id), user=user_output(user))
 
 
 @app.post("/api/auth/register", response_model=AuthOut, status_code=201)
@@ -406,7 +466,59 @@ def login(data: LoginInput, db: Db):
 
 @app.get("/api/auth/me", response_model=UserOut)
 def me(user: CurrentUser):
-    return user
+    return user_output(user)
+
+
+@app.patch("/api/users/me", response_model=UserOut)
+def update_profile(data: ProfileInput, db: Db, user: CurrentUser):
+    if data.birth_date and data.birth_date > date.today():
+        raise HTTPException(status_code=422, detail="Дата рождения не может быть в будущем.")
+    user.bio = data.bio.strip()
+    user.birth_date = data.birth_date
+    db.commit()
+    db.refresh(user)
+    payload = user_output(user)
+    publish_user_presence(db, user.id)
+    return payload
+
+
+@app.post("/api/users/me/avatar", status_code=201)
+def create_avatar_upload(data: AvatarUploadInput, user: CurrentUser):
+    storage = storage_client()
+    object_key = f"avatars/{user.id}/{uuid4().hex}"
+    upload_url = storage.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": ATTACHMENTS_BUCKET, "Key": object_key, "ContentType": data.content_type},
+        ExpiresIn=600,
+    )
+    return {"upload_url": upload_url, "object_key": object_key, "headers": {"Content-Type": data.content_type}}
+
+
+@app.put("/api/users/me/avatar", response_model=UserOut)
+def complete_avatar_upload(data: AvatarCompleteInput, db: Db, user: CurrentUser):
+    if not data.object_key.startswith(f"avatars/{user.id}/"):
+        raise HTTPException(status_code=403, detail="Нельзя изменить этот аватар.")
+    storage = storage_client()
+    try:
+        uploaded = storage.head_object(Bucket=ATTACHMENTS_BUCKET, Key=data.object_key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            raise HTTPException(status_code=409, detail="Изображение ещё не загружено.") from exc
+        raise
+    if uploaded.get("ContentLength", 0) > 5 * 1024 * 1024:
+        delete_storage_objects([data.object_key])
+        raise HTTPException(status_code=413, detail="Размер аватара не должен превышать 5 МБ.")
+    if not (uploaded.get("ContentType") or "").startswith("image/"):
+        delete_storage_objects([data.object_key])
+        raise HTTPException(status_code=415, detail="Аватар должен быть изображением.")
+    old_key = user.avatar_key
+    user.avatar_key = data.object_key
+    db.commit()
+    db.refresh(user)
+    if old_key:
+        delete_storage_objects([old_key])
+    return user_output(user)
 
 
 @app.delete("/api/auth/account", status_code=204)
@@ -466,6 +578,8 @@ def delete_account(data: AccountDeletionInput, db: Db, user: CurrentUser):
             )
         )
     ).all()
+    if user.avatar_key:
+        attachment_keys.append(user.avatar_key)
     delete_storage_objects(attachment_keys)
     db.execute(
         delete(Reaction).where(
@@ -555,7 +669,7 @@ def message_payloads(db: Session, messages: list[Message], viewer_id: UUID) -> l
             created_at=message.created_at,
             edited_at=message.edited_at,
             deleted_at=message.deleted_at,
-            author=UserOut.model_validate(author),
+            author=user_output(author),
             reactions=[
                 ReactionOut(emoji=emoji, count=len(reactors), reacted=viewer_id in reactors)
                 for emoji, reactors in reactions[message.id].items()
@@ -606,6 +720,21 @@ def publish_new_conversation(db: Session, conversation: Conversation) -> None:
         })
 
 
+def publish_user_presence(db: Session, user_id: UUID) -> None:
+    conversation_ids = select(ConversationMember.conversation_id).where(ConversationMember.user_id == user_id)
+    recipients = db.scalars(
+        select(ConversationMember.user_id)
+        .where(ConversationMember.conversation_id.in_(conversation_ids), ConversationMember.user_id != user_id)
+        .distinct()
+    ).all()
+    user = db.get(User, user_id)
+    if user is not None:
+        publish_users(recipients, {
+            "type": "presence_updated",
+            "user": jsonable_encoder(user_output(user).model_dump(mode="json")),
+        })
+
+
 @app.get("/api/users/search", response_model=list[UserSearchOut])
 def search_users(
     db: Db,
@@ -615,13 +744,14 @@ def search_users(
     query = q.strip().lstrip("@").casefold()
     if not query:
         return []
-    return db.scalars(
+    users = db.scalars(
         select(User)
         .where(User.id != user.id)
         .where((User.username_key.contains(query)) | (User.tag.contains(query)))
         .order_by(User.username_key)
         .limit(20)
     ).all()
+    return [user_output(item) for item in users]
 
 
 def create_direct_conversation(db: Session, user: User, other: User) -> tuple[Conversation, bool]:
@@ -677,6 +807,98 @@ def create_group(data: GroupInput, db: Db, user: CurrentUser):
     return conversation_payload(db, conversation, user.id)
 
 
+def require_group_owner(db: Session, conversation_id: UUID, user_id: UUID) -> Conversation:
+    conversation = membership(db, conversation_id, user_id)
+    if conversation.kind != "group" or conversation.created_by != user_id:
+        raise HTTPException(status_code=403, detail="Управлять группой может только её создатель.")
+    return conversation
+
+
+@app.post("/api/conversations/{conversation_id}/members", response_model=ConversationOut)
+def add_group_members(
+    conversation_id: UUID,
+    data: GroupMembersInput,
+    db: Db,
+    user: CurrentUser,
+):
+    conversation = require_group_owner(db, conversation_id, user.id)
+    usernames = {name.strip().casefold() for name in data.usernames} - {user.username_key}
+    users = db.scalars(select(User).where(User.username_key.in_(usernames))).all() if usernames else []
+    if len(users) != len(usernames):
+        raise HTTPException(status_code=404, detail="Один или несколько пользователей не найдены.")
+    existing_ids = set(db.scalars(
+        select(ConversationMember.user_id).where(ConversationMember.conversation_id == conversation.id)
+    ).all())
+    new_users = [item for item in users if item.id not in existing_ids]
+    if len(existing_ids) + len(new_users) > 50:
+        raise HTTPException(status_code=422, detail="В группе может быть не более 50 участников.")
+    db.add_all(ConversationMember(conversation_id=conversation.id, user_id=item.id) for item in new_users)
+    conversation.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(conversation)
+    publish_new_conversation(db, conversation)
+    return conversation_payload(db, conversation, user.id)
+
+
+@app.delete("/api/conversations/{conversation_id}/members/{member_id}", status_code=204)
+def remove_group_member(conversation_id: UUID, member_id: UUID, db: Db, user: CurrentUser):
+    conversation = require_group_owner(db, conversation_id, user.id)
+    if member_id == user.id:
+        raise HTTPException(status_code=422, detail="Чтобы выйти из группы, используй действие «Выйти из группы».")
+    member = db.scalar(select(ConversationMember).where(
+        ConversationMember.conversation_id == conversation.id,
+        ConversationMember.user_id == member_id,
+    ))
+    if member is None:
+        raise HTTPException(status_code=404, detail="Участник не найден.")
+    db.delete(member)
+    conversation.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    publish_users([member_id], {"type": "conversation_deleted", "conversation_id": str(conversation.id)})
+    publish_new_conversation(db, conversation)
+
+
+@app.post("/api/conversations/{conversation_id}/leave", status_code=204)
+def leave_group(conversation_id: UUID, db: Db, user: CurrentUser):
+    conversation = membership(db, conversation_id, user.id)
+    if conversation.kind != "group":
+        raise HTTPException(status_code=422, detail="Выйти можно только из группы.")
+    former_members = db.scalars(
+        select(ConversationMember.user_id).where(ConversationMember.conversation_id == conversation.id)
+    ).all()
+    db.execute(delete(ConversationMember).where(
+        ConversationMember.conversation_id == conversation.id,
+        ConversationMember.user_id == user.id,
+    ))
+    remaining = [member_id for member_id in former_members if member_id != user.id]
+    if not remaining:
+        db.delete(conversation)
+        db.commit()
+        publish_users(former_members, {"type": "conversation_deleted", "conversation_id": str(conversation_id)})
+        return
+    if conversation.created_by == user.id:
+        conversation.created_by = secrets.choice(remaining)
+    conversation.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    publish_users([user.id], {"type": "conversation_deleted", "conversation_id": str(conversation_id)})
+    publish_new_conversation(db, conversation)
+
+
+@app.delete("/api/conversations/{conversation_id}", status_code=204)
+def delete_group(conversation_id: UUID, db: Db, user: CurrentUser):
+    conversation = require_group_owner(db, conversation_id, user.id)
+    member_ids = db.scalars(
+        select(ConversationMember.user_id).where(ConversationMember.conversation_id == conversation.id)
+    ).all()
+    attachment_keys = db.scalars(
+        select(Attachment.object_key).where(Attachment.conversation_id == conversation.id)
+    ).all()
+    delete_storage_objects(attachment_keys)
+    db.delete(conversation)
+    db.commit()
+    publish_users(member_ids, {"type": "conversation_deleted", "conversation_id": str(conversation_id)})
+
+
 def conversation_payload(db: Session, conversation: Conversation, viewer_id: UUID) -> ConversationOut:
     return conversation_payloads(db, [conversation], viewer_id)[0]
 
@@ -719,12 +941,13 @@ def conversation_payloads(db: Session, conversations: list[Conversation], viewer
         ConversationOut(
             id=conversation.id,
             kind=conversation.kind,
+            created_by=conversation.created_by,
             name=conversation.name or next(
                 (item.username for item in members[conversation.id] if item.id != viewer_id),
                 "Личный чат",
             ),
             updated_at=conversation.updated_at,
-            members=[UserOut.model_validate(item) for item in members[conversation.id]],
+            members=[user_output(item) for item in members[conversation.id]],
             last_message=latest_by_conversation.get(conversation.id),
         )
         for conversation in conversations
@@ -740,6 +963,21 @@ def list_conversations(db: Db, user: CurrentUser):
         .order_by(Conversation.updated_at.desc())
     ).all()
     return conversation_payloads(db, conversations, user.id)
+
+
+@app.get("/api/presence", response_model=list[UserOut])
+def list_presence(db: Db, user: CurrentUser):
+    member_ids = select(ConversationMember.conversation_id).where(ConversationMember.user_id == user.id)
+    users = db.scalars(
+        select(User)
+        .join(ConversationMember, ConversationMember.user_id == User.id)
+        .where(
+            ConversationMember.conversation_id.in_(member_ids),
+            User.id != user.id,
+        )
+        .distinct()
+    ).all()
+    return [user_output(member) for member in users]
 
 
 @app.get("/api/sync", response_model=SyncOut)
@@ -988,10 +1226,12 @@ class WebSocketManager:
     async def connect(self, user_id: UUID, socket: WebSocket) -> None:
         self.connections[user_id].add(socket)
 
-    def disconnect(self, user_id: UUID, socket: WebSocket) -> None:
+    def disconnect(self, user_id: UUID, socket: WebSocket) -> bool:
         self.connections[user_id].discard(socket)
         if not self.connections[user_id]:
             self.connections.pop(user_id, None)
+            return True
+        return False
 
     async def disconnect_user(self, user_id: UUID) -> None:
         sockets = list(self.connections.pop(user_id, ()))
@@ -1052,10 +1292,54 @@ async def websocket_endpoint(socket: WebSocket):
         with SessionLocal() as db:
             user = user_from_token(token, db)
             user_id = user.id
+            user.is_online = True
+            user.last_seen_at = datetime.now(timezone.utc)
+            db.commit()
         await websockets.connect(user_id, socket)
         await socket.send_json({"type": "connected"})
+        with SessionLocal() as db:
+            publish_user_presence(db, user_id)
         while True:
-            await socket.receive_text()
+            event = await socket.receive_json()
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type == "heartbeat":
+                with SessionLocal() as db:
+                    current = db.get(User, user_id)
+                    if current is not None:
+                        current.is_online = True
+                        current.last_seen_at = datetime.now(timezone.utc)
+                        db.commit()
+                continue
+            if event_type not in {"typing", "typing_stopped"}:
+                continue
+            try:
+                conversation_id = UUID(str(event.get("conversation_id")))
+            except ValueError:
+                continue
+            with SessionLocal() as db:
+                conversation = db.get(Conversation, conversation_id)
+                if conversation is None or db.scalar(
+                    select(ConversationMember.id).where(
+                        ConversationMember.conversation_id == conversation_id,
+                        ConversationMember.user_id == user_id,
+                    )
+                ) is None:
+                    continue
+                username = db.scalar(select(User.username).where(User.id == user_id))
+                member_ids = db.scalars(
+                    select(ConversationMember.user_id).where(
+                        ConversationMember.conversation_id == conversation_id,
+                        ConversationMember.user_id != user_id,
+                    )
+                ).all()
+            publish_users(member_ids, {
+                "type": event_type,
+                "conversation_id": str(conversation_id),
+                "user_id": str(user_id),
+                "username": username,
+            })
     except WebSocketDisconnect:
         pass
     except (asyncio.TimeoutError, ValueError, HTTPException, jwt.PyJWTError):
@@ -1065,4 +1349,12 @@ async def websocket_endpoint(socket: WebSocket):
             pass
     finally:
         if user_id is not None:
-            websockets.disconnect(user_id, socket)
+            last_connection = websockets.disconnect(user_id, socket)
+            if last_connection and SessionLocal is not None:
+                with SessionLocal() as db:
+                    user = db.get(User, user_id)
+                    if user is not None:
+                        user.is_online = False
+                        user.last_seen_at = datetime.now(timezone.utc)
+                        db.commit()
+                        publish_user_presence(db, user_id)
